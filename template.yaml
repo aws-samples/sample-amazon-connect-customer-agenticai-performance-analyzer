@@ -1,0 +1,919 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Connect AI Agent Performance Analyzer -
+  Processes Contact Lens analysis files, enriches with QConnect span data,
+  and serves performance dashboards via CloudFront + React.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: connect-analyzer
+    Description: Project name used as prefix for all resource names
+    AllowedPattern: ^[a-z0-9][a-z0-9\-]{0,31}$
+    ConstraintDescription: Lowercase alphanumeric with hyphens, max 32 chars
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  ConnectInstanceId:
+    Type: String
+    Description: Amazon Connect instance ID (UUID)
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+    ConstraintDescription: Must be a valid UUID
+
+  QConnectAssistantId:
+    Type: String
+    Description: Amazon QConnect assistant ID (UUID)
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+    ConstraintDescription: Must be a valid UUID
+
+  ConnectRecordingBucket:
+    Type: String
+    Description: S3 bucket name storing Connect call recordings (must already exist)
+    MinLength: 3
+
+  EnableAuthenticatedAccess:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable Cognito User Pool for authenticated dashboard access
+
+  CustomDomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain for CloudFront (leave empty for default *.cloudfront.net)
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for custom domain (us-east-1, required if CustomDomainName set)
+
+  KmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional KMS key ARN for DynamoDB encryption (empty = AWS managed keys)
+
+  QConnectKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional KMS key ARN that encrypts the Q Connect (Amazon Q in Connect) assistant
+      and its AI agents. Grants the pipeline Lambda kms:Decrypt so ListAIAgents /
+      GetAIAgent succeed and agent names resolve. Leave empty if the assistant uses an
+      AWS-managed key.
+
+  ConnectLogGroupName:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional CloudWatch Logs group holding Connect agentic (Q in Connect) session
+      logs. Leave empty (recommended) to auto-discover it from the assistant's
+      CloudWatch Logs delivery configuration. Set only to override auto-discovery.
+
+  AdminEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Email of the initial admin user to create in the Cognito User Pool. Cognito
+      emails a temporary password to this address. Self sign-up is disabled, so users
+      can only be created by an admin. Leave empty to skip user creation.
+
+  CorrelationLookbackDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: >
+      How many days back the pipeline searches CloudWatch Logs to correlate a contact
+      to its QConnect session and voice config. Default 7 for live traffic; raise it
+      (e.g. 21) when backfilling older contacts.
+
+# =============================================================================
+# Conditions
+# =============================================================================
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, '']]
+  HasAcmCert: !Not [!Equals [!Ref AcmCertificateArn, '']]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, '']]
+  HasQConnectKmsKey: !Not [!Equals [!Ref QConnectKmsKeyArn, '']]
+  AuthEnabled: !Equals [!Ref EnableAuthenticatedAccess, 'true']
+  HasAdminUser: !And
+    - !Condition AuthEnabled
+    - !Not [!Equals [!Ref AdminEmail, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB Tables
+  # ---------------------------------------------------------------------------
+  DynamoDBKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName}-${Environment} DynamoDB tables'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Key administration — scoped admin actions for the account root.
+          # Excludes cryptographic-use actions (those are granted separately below).
+          - Sid: KeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Describe*
+              - kms:Get*
+              - kms:List*
+              - kms:PutKeyPolicy
+              - kms:UpdateKeyDescription
+              - kms:EnableKeyRotation
+              - kms:DisableKeyRotation
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          # Cryptographic use — the minimum actions DynamoDB (and the Lambda)
+          # need to encrypt/decrypt data with this key.
+          - Sid: KeyUsage
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          # Grants — DynamoDB creates grants on the key to encrypt table data.
+          # Restricted to grants made on behalf of AWS services via the grant
+          # constraint, so this does not broaden direct key access.
+          - Sid: AllowServiceGrants
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: '*'
+            Condition:
+              Bool:
+                'kms:GrantIsForAWSResource': 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-dynamodb-key'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    # Deleted with the stack. This is a sample: teardown (deploy.sh --destroy) should
+    # be clean and leave no orphaned resources. Analysis data has a 30-day TTL and can
+    # be re-generated by reprocessing contacts, so it is not worth retaining. For a
+    # production deployment where the data must survive stack deletion, change these to
+    # Retain.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: contactId
+          AttributeType: S
+        - AttributeName: assistantId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: agentName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: contactId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: assistantId-index
+          KeySchema:
+            - AttributeName: assistantId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: agentName-index
+          KeySchema:
+            - AttributeName: agentName
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !If
+          - HasKmsKey
+          - !Ref KmsKeyArn
+          - !Ref DynamoDBKmsKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-sessions'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AgentsTable:
+    Type: AWS::DynamoDB::Table
+    # Deleted with the stack (see SessionsTable). The agents table is just a cache of
+    # QConnect AI agent metadata and is rebuilt on the next run, so retention is
+    # unnecessary. Change to Retain for a production deployment if desired.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: agentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: agentId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !If
+          - HasKmsKey
+          - !Ref KmsKeyArn
+          - !Ref DynamoDBKmsKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-agents'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------------------
+  # Lambda Function + IAM
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-${Environment}-lambda-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:DescribeLogGroups
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              # Discover the Q Connect agentic log group dynamically from its CloudWatch
+              # Logs delivery configuration. These describe APIs are account-level and
+              # do not support resource-level scoping, so they require Resource '*'.
+              - Sid: CloudWatchLogsDeliveryDiscovery
+                Effect: Allow
+                Action:
+                  - logs:DescribeDeliverySources
+                  - logs:DescribeDeliveries
+                  - logs:DescribeDeliveryDestinations
+                Resource: '*'
+              - Sid: S3ReadContactLens
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ConnectRecordingBucket}/Analysis/Voice/ivr/*'
+              # List (prefix-scoped) so the pipeline can locate a Contact Lens file by
+              # contactId when re-processing a record that was written before its
+              # correlation logs were available (self-heal of incomplete records).
+              - Sid: S3ListContactLens
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${ConnectRecordingBucket}'
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - 'Analysis/Voice/ivr/*'
+              - Sid: QConnectRead
+                Effect: Allow
+                Action:
+                  - qconnect:ListSpans
+                  - qconnect:ListAiAgents
+                  - qconnect:ListAIAgents
+                  - qconnect:ListAssistants
+                  - qconnect:ListSessions
+                  - qconnect:GetAIAgent
+                  - qconnect:GetSession
+                  - wisdom:ListSpans
+                  - wisdom:ListSessions
+                  - wisdom:GetSession
+                  - wisdom:ListAIAgents
+                  - wisdom:GetAIAgent
+                  - wisdom:ListAssistants
+                Resource: '*'
+              - Sid: DynamoDBWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt SessionsTable.Arn
+                  - !Sub '${SessionsTable.Arn}/index/*'
+                  - !GetAtt AgentsTable.Arn
+              - Sid: ConnectDescribe
+                Effect: Allow
+                Action:
+                  - connect:DescribeContact
+                  - connect:DescribeInstance
+                Resource:
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact/*'
+              - !If
+                - HasKmsKey
+                - Sid: KMSDecrypt
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref KmsKeyArn
+                - Sid: KMSDecrypt
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !GetAtt DynamoDBKmsKey.Arn
+              # Decrypt the Q Connect assistant's KMS key so ListAIAgents / GetAIAgent
+              # succeed and agent names resolve. Only added when the key ARN is provided.
+              - !If
+                - HasQConnectKmsKey
+                - Sid: QConnectKMSDecrypt
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref QConnectKmsKeyArn
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-lambda-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PipelineFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: handler.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code: ./lambda-python/lambda.zip
+      Environment:
+        Variables:
+          SESSIONS_TABLE_NAME: !Ref SessionsTable
+          AGENTS_TABLE_NAME: !Ref AgentsTable
+          QCONNECT_ASSISTANT_ID: !Ref QConnectAssistantId
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          LOG_GROUP_NAME: !Ref ConnectLogGroupName
+          CORRELATION_LOOKBACK_DAYS: !Ref CorrelationLookbackDays
+          # Recording bucket, used to locate a Contact Lens file by contactId when
+          # re-processing legacy incomplete records that have no stored sourceKey.
+          RECORDING_BUCKET: !Ref ConnectRecordingBucket
+          # The Lambda bundles a newer boto3/botocore (pinned in deploy.sh) that
+          # includes the QConnect ListSpans API. AWS_DATA_PATH points botocore at
+          # the bundled service models so ListSpans resolves even if the runtime's
+          # built-in botocore is used. Code is unpacked to /var/task on Lambda.
+          AWS_DATA_PATH: /var/task/botocore/data
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-pipeline'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PipelineFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${ConnectRecordingBucket}'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # ---------------------------------------------------------------------------
+  # NOTE: S3 Bucket Notification cannot be set on an existing bucket via CFN.
+  # The deploy script uses the AWS CLI to configure the S3 event notification
+  # on the existing Connect recording bucket after stack creation.
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket + CloudFront for Frontend
+  # ---------------------------------------------------------------------------
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        LogFilePrefix: self-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-access-logs'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: s3-access-logs/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-frontend'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${Environment}-oac-${AWS::StackName}'
+        Description: !Sub 'OAC for ${ProjectName}-${Environment} frontend'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref CustomDomainName]
+          - !Ref 'AWS::NoValue'
+        Origins:
+          - Id: s3-origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed CachingOptimized
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+        ViewerCertificate:
+          MinimumProtocolVersion: TLSv1.2_2021
+          AcmCertificateArn: !If
+            - HasAcmCert
+            - !Ref AcmCertificateArn
+            - !Ref 'AWS::NoValue'
+          SslSupportMethod: !If
+            - HasAcmCert
+            - sni-only
+            - !Ref 'AWS::NoValue'
+          CloudFrontDefaultCertificate: !If
+            - HasAcmCert
+            - !Ref 'AWS::NoValue'
+            - true
+        Logging:
+          Bucket: !GetAtt AccessLogsBucket.DomainName
+          IncludeCookies: false
+          Prefix: cloudfront-logs/
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cloudfront'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOACAccess
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------------
+  # Cognito - User Pool (conditional) + Identity Pool
+  # ---------------------------------------------------------------------------
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: AuthEnabled
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Environment}-user-pool'
+      # UsernameAttributes MUST match the deployed pool. The live pool was created with
+      # email-as-username, and UsernameAttributes is immutable: omitting it here makes
+      # CloudFormation attempt to change the immutable property and the stack update
+      # fails ("Updates are not allowed for property - UsernameAttributes"). Keeping it
+      # declared to match reality means CloudFormation sees no change on updates.
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      # Disable public self sign-up: only an admin can create users. Cognito emails
+      # the temporary password to invited users.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: !Sub 'Your ${ProjectName} dashboard access'
+          EmailMessage: >-
+            You have been given access to the dashboard.<br><br>Username:
+            {username}<br>Temporary password: {####}<br><br>Sign in and you will be
+            prompted to set a new password.
+          SMSMessage: 'Username: {username} Temporary password: {####}'
+      UserPoolTags:
+        Name: !Sub '${ProjectName}-${Environment}-user-pool'
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: AuthEnabled
+    Properties:
+      ClientName: !Sub '${ProjectName}-${Environment}-user-pool-client'
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders: [COGNITO]
+
+  # Initial admin user, provisioned by CloudFormation via a Custom Resource.
+  #
+  # We do NOT use the native AWS::Cognito::UserPoolUser here. On a pool with
+  # UsernameAttributes: [email] the physical username must be a Cognito-assigned UUID,
+  # not the email; the native resource sets Username to the email and fails on every
+  # update ("Value at 'username' failed to satisfy constraint ..."), rolling the stack
+  # back. A Custom Resource backed by a small inline Lambda calls admin-create-user
+  # imperatively, which lets Cognito assign the UUID and email the temporary password.
+  # It is idempotent (UsernameExistsException is treated as success) so stack updates
+  # do not fail, and it does not delete the user on stack update/delete.
+  CognitoAdminUserFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasAdminUser
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cognito-admin-create-user
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminGetUser
+                Resource: !GetAtt CognitoUserPool.Arn
+
+  CognitoAdminUserFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasAdminUser
+    Properties:
+      Description: Creates the initial Cognito admin user (idempotent) for the dashboard.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt CognitoAdminUserFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, urllib.request, json
+          cognito = boto3.client("cognito-idp")
+
+          def _respond(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log stream: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  rtype = event["RequestType"]
+                  props = event.get("ResourceProperties", {})
+                  pool_id = props["UserPoolId"]
+                  email = props["AdminEmail"]
+                  # Only create on Create/Update; never delete the user on stack delete
+                  # (so tearing down / rebuilding the stack does not lock out the admin).
+                  if rtype in ("Create", "Update") and email:
+                      try:
+                          cognito.admin_create_user(
+                              UserPoolId=pool_id,
+                              Username=email,
+                              UserAttributes=[
+                                  {"Name": "email", "Value": email},
+                                  {"Name": "email_verified", "Value": "true"},
+                              ],
+                              DesiredDeliveryMediums=["EMAIL"],
+                          )
+                          print(f"created admin user {email}")
+                      except cognito.exceptions.UsernameExistsException:
+                          print(f"admin user {email} already exists; nothing to do")
+                  _respond(event, context, "SUCCESS")
+              except Exception as e:
+                  print(f"error: {e}")
+                  # Do not block the stack on admin-user provisioning failures.
+                  _respond(event, context, "SUCCESS", reason=f"Non-fatal: {e}")
+
+  CognitoAdminUser:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: HasAdminUser
+    Properties:
+      ServiceToken: !GetAtt CognitoAdminUserFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      AdminEmail: !Ref AdminEmail
+
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${ProjectName}-${Environment}-identity-pool'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders: !If
+        - AuthEnabled
+        - - ClientId: !Ref CognitoUserPoolClient
+            ProviderName: !GetAtt CognitoUserPool.ProviderName
+            ServerSideTokenCheck: true
+        - !Ref 'AWS::NoValue'
+
+  CognitoIdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles:
+        unauthenticated: !GetAtt CognitoUnauthRole.Arn
+        authenticated: !If
+          - AuthEnabled
+          - !GetAtt CognitoAuthRole.Arn
+          - !Ref 'AWS::NoValue'
+
+  # ---------------------------------------------------------------------------
+  # Cognito IAM Roles
+  # ---------------------------------------------------------------------------
+  CognitoUnauthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref CognitoIdentityPool
+              ForAnyValue:StringLike:
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      Policies:
+        - PolicyName: DenyAll
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DenyAll
+                Effect: Deny
+                Action: '*'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cognito-unauth-role'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CognitoAuthRole:
+    Type: AWS::IAM::Role
+    Condition: AuthEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref CognitoIdentityPool
+              ForAnyValue:StringLike:
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: DynamoDBReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDBReadOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !GetAtt SessionsTable.Arn
+                  - !Sub '${SessionsTable.Arn}/index/*'
+                  - !GetAtt AgentsTable.Arn
+                  - !Sub '${AgentsTable.Arn}/index/*'
+              # The DynamoDB tables are encrypted with a customer-managed KMS key,
+              # so reading items requires permission to decrypt with that key.
+              - Sid: DynamoDBKmsDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt DynamoDBKmsKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  CloudFrontURL:
+    Description: CloudFront distribution URL for the React dashboard
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+
+  FrontendBucketName:
+    Description: S3 bucket hosting the React frontend
+    Value: !Ref FrontendBucket
+
+  SessionsTableName:
+    Description: DynamoDB sessions table name
+    Value: !Ref SessionsTable
+
+  AgentsTableName:
+    Description: DynamoDB agents table name
+    Value: !Ref AgentsTable
+
+  CognitoIdentityPoolId:
+    Description: Cognito Identity Pool ID for frontend credentials
+    Value: !Ref CognitoIdentityPool
+
+  CognitoUserPoolId:
+    Condition: AuthEnabled
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Condition: AuthEnabled
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+
+  LambdaFunctionArn:
+    Description: Pipeline Lambda function ARN
+    Value: !GetAtt PipelineFunction.Arn
+
+  LambdaFunctionName:
+    Description: Pipeline Lambda function name
+    Value: !Ref PipelineFunction

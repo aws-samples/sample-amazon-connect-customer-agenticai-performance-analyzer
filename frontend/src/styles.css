@@ -1,0 +1,203 @@
+/* Amazon Connect AI Agent Performance Analyzer - Custom Styles */
+
+/* Header gradient banner */
+[class*="awsui_content-layout-header"] {
+  background: linear-gradient(135deg, #1a237e 0%, #0d47a1 50%, #01579b 100%) !important;
+  border-radius: 0 0 12px 12px;
+  padding-bottom: 20px !important;
+}
+
+[class*="awsui_content-layout-header"] h1,
+[class*="awsui_content-layout-header"] [class*="header-variant-h1"] {
+  color: #fff !important;
+}
+
+[class*="awsui_content-layout-header"] [class*="description"] {
+  color: rgba(255, 255, 255, 0.85) !important;
+}
+
+/* Container cards with subtle shadows and rounded corners */
+[class*="awsui_container"] {
+  border-radius: 12px !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06) !important;
+  transition: box-shadow 0.2s ease;
+}
+
+[class*="awsui_container"]:hover {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1) !important;
+}
+
+/* Table styling */
+[class*="awsui_table"] {
+  border-radius: 8px !important;
+  overflow: hidden;
+}
+
+[class*="awsui_header-cell"] {
+  background: #f8fafc !important;
+  font-weight: 600 !important;
+  text-transform: uppercase;
+  font-size: 11px !important;
+  letter-spacing: 0.5px;
+}
+
+/* Selected row highlight */
+[class*="awsui_row-selected"] {
+  background: #eff6ff !important;
+  border-left: 3px solid #2563eb !important;
+}
+
+/* Tabs styling */
+[class*="awsui_tabs-tab--active"] {
+  border-bottom: 3px solid #2563eb !important;
+  font-weight: 600 !important;
+}
+
+/* Badge styling */
+[class*="awsui_badge"] {
+  border-radius: 6px !important;
+  font-weight: 600 !important;
+}
+
+/* Button enhancements */
+[class*="awsui_button--primary"] {
+  border-radius: 8px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.3px;
+}
+
+/* Form field labels */
+[class*="awsui_label"] {
+  font-weight: 600 !important;
+  color: #374151 !important;
+  font-size: 13px !important;
+}
+
+/* Multiselect tokens */
+[class*="awsui_token"] {
+  border-radius: 6px !important;
+  background: #eff6ff !important;
+  border: 1px solid #bfdbfe !important;
+}
+
+/* Alert styling */
+[class*="awsui_alert"] {
+  border-radius: 8px !important;
+}
+
+/* Quick select buttons row */
+.quick-select-row {
+  display: flex;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px solid #f1f5f9;
+  border-bottom: 1px solid #f1f5f9;
+  margin: 4px 0;
+}
+
+/* Turn cards in latency breakdown */
+.turn-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 16px;
+  background: #fff;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.turn-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+/* Conversation flow cards */
+.conversation-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px 16px;
+  background: #fff;
+  transition: background 0.15s ease;
+}
+
+.conversation-card:hover {
+  background: #fafbfc;
+}
+
+/* Customer wait badge pulse for high values */
+@keyframes pulse-red {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+
+.wait-badge-critical {
+  animation: pulse-red 2s infinite;
+}
+
+/* Bar chart hover effect */
+.bar-segment {
+  transition: filter 0.15s ease;
+  cursor: default;
+}
+
+.bar-segment:hover {
+  filter: brightness(1.1);
+}
+
+/* Expandable section styling */
+[class*="awsui_expandable-section"] {
+  border-radius: 8px !important;
+}
+
+/* Pagination styling */
+[class*="awsui_pagination"] {
+  padding: 12px 0 !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Stats table value styling */
+.stat-value-good {
+  color: #16a34a;
+  font-weight: 600;
+}
+
+.stat-value-warn {
+  color: #d97706;
+  font-weight: 600;
+}
+
+.stat-value-bad {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+/* Loading spinner overlay */
+.loading-overlay {
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 12px;
+  backdrop-filter: blur(4px);
+}
+
+/* Footer info bar */
+.footer-info {
+  padding: 12px 0;
+  border-top: 1px solid #e5e7eb;
+  margin-top: 16px;
+}

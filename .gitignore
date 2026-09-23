@@ -1,0 +1,37 @@
+# Build artifacts
+lambda-python/package/
+lambda-python/lambda.zip
+frontend/node_modules/
+frontend/build/
+frontend/.env
+frontend/package-lock.json
+packaged-template.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Holmes scan reports
+holmes-report*.json
+.holmes/
+
+# Security scan reports — all kept local, never committed to git
+SECURITY-SCAN-REPORT.md
+semgrep-report.json
+security-reports/
+# Terraform — deployment is via CloudFormation in this repo; Terraform assets are
+# kept local and are intentionally not committed.
+terraform/
+deploy-terraform.sh
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+# PowerPoint source for diagrams (the exported PNG is committed instead) and
+# temporary Office lock files.
+*.pptx
+~$*

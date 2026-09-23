@@ -1,0 +1,4 @@
+Connect Instance: <fill this>
+QConnect Assistant: <fill this>
+Recording Bucket: <fill this>
+ADMIN_EMAIL: <fill this>
